@@ -488,7 +488,7 @@ defmodule AshSqlite.DataLayer do
   def can?(_, :filter), do: true
   def can?(_, :limit), do: true
   def can?(_, :offset), do: true
-  def can?(_, :multitenancy), do: false
+  def can?(_, :multitenancy), do: true
 
   def can?(_, {:filter_relationship, %{manual: {module, _}}}) do
     Spark.implements_behaviour?(module, AshSqlite.ManualRelationship)
@@ -512,6 +512,31 @@ defmodule AshSqlite.DataLayer do
   def can?(_, :distinct), do: false
   def can?(_, {:sort, _}), do: true
   def can?(_, _), do: false
+
+  @impl true
+  @doc """
+  Context multitenancy for SQLite means **one database per tenant**.
+
+  SQLite has no schemas, so unlike `AshPostgres` there is no query prefix to
+  set and the generated SQL is identical for every tenant. Isolation comes from
+  which database file the connection is attached to, which is chosen before the
+  query reaches this data layer — typically by starting one repo instance per
+  tenant and binding it with `c:Ecto.Repo.put_dynamic_repo/1`.
+
+  This callback is therefore a no-op on the query itself. It exists so that
+  `strategy :context` resources are accepted and so Ash enforces its own
+  "tenant is required unless `global?`" rule.
+
+  > #### Isolation is not enforced here {: .warning}
+  >
+  > Declaring `strategy :context` does **not** by itself separate tenants. If
+  > every tenant resolves to the same database, every tenant shares a table and
+  > nothing here will say so. Whatever selects the connection is responsible for
+  > ensuring it matches the tenant, and for failing closed when it cannot.
+  """
+  def set_tenant(_resource, query, _tenant) do
+    {:ok, query}
+  end
 
   @impl true
   def limit(query, nil, _), do: {:ok, query}
@@ -643,7 +668,7 @@ defmodule AshSqlite.DataLayer do
     |> Enum.group_by(&Map.keys(&1.attributes))
     |> Enum.reduce_while({:ok, []}, fn {_, changesets}, {:ok, acc} ->
       repo = AshSql.dynamic_repo(resource, AshSqlite.SqlImplementation, Enum.at(changesets, 0))
-      opts = AshSql.repo_opts(repo, AshSqlite.SqlImplementation, nil, options[:tenant], resource)
+      opts = AshSql.repo_opts(repo, AshSqlite.SqlImplementation, nil, nil, resource)
 
       opts =
         if options.return_records? do
@@ -1592,7 +1617,7 @@ defmodule AshSqlite.DataLayer do
                 repo,
                 AshSqlite.SqlImplementation,
                 changeset.timeout,
-                changeset.tenant,
+                nil,
                 changeset.resource
               )
 
@@ -1653,7 +1678,7 @@ defmodule AshSqlite.DataLayer do
               repo,
               AshSqlite.SqlImplementation,
               changeset.timeout,
-              changeset.tenant,
+              nil,
               changeset.resource
             )
 
@@ -1779,7 +1804,7 @@ defmodule AshSqlite.DataLayer do
               repo,
               AshSqlite.SqlImplementation,
               changeset.timeout,
-              changeset.tenant,
+              nil,
               changeset.resource
             )
 
