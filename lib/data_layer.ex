@@ -203,6 +203,11 @@ defmodule AshSqlite.DataLayer do
         doc:
           "The repo that will be used to fetch your data. See the `AshSqlite.Repo` documentation for more. Can also be a function that takes a resource and a type `:read | :mutate` and returns the repo."
       ],
+      tenant_binder: [
+        type: {:behaviour, AshSqlite.TenantBinder},
+        doc:
+          "A module that selects the connection a tenanted statement runs on. Required for database-per-tenant layouts, where the tenant is a database file rather than a query prefix. See `AshSqlite.TenantBinder`."
+      ],
       migrate?: [
         type: :boolean,
         default: true,
@@ -519,20 +524,24 @@ defmodule AshSqlite.DataLayer do
 
   SQLite has no schemas, so unlike `AshPostgres` there is no query prefix to
   set and the generated SQL is identical for every tenant. Isolation comes from
-  which database file the connection is attached to, which is chosen before the
-  query reaches this data layer — typically by starting one repo instance per
-  tenant and binding it with `c:Ecto.Repo.put_dynamic_repo/1`.
+  which database file the connection is attached to.
 
   This callback is therefore a no-op on the query itself. It exists so that
   `strategy :context` resources are accepted and so Ash enforces its own
   "tenant is required unless `global?`" rule.
 
+  The connection is chosen separately, per statement, by the resource's
+  `tenant_binder` — see `AshSqlite.TenantBinder`. The tenant reaches that code by
+  a different route: Ash puts it in the query context (`private.tenant`), which
+  `set_context/3` stores in `__ash_bindings__`, and writes carry it on the
+  changeset.
+
   > #### Isolation is not enforced here {: .warning}
   >
-  > Declaring `strategy :context` does **not** by itself separate tenants. If
-  > every tenant resolves to the same database, every tenant shares a table and
-  > nothing here will say so. Whatever selects the connection is responsible for
-  > ensuring it matches the tenant, and for failing closed when it cannot.
+  > Declaring `strategy :context` does **not** by itself separate tenants. Without
+  > a `tenant_binder` every tenant resolves to whatever connection the calling
+  > process holds, so every tenant may share one table and nothing here will say
+  > so. The binder is what makes the declaration mean something.
   """
   def set_tenant(_resource, query, _tenant) do
     {:ok, query}
@@ -587,16 +596,22 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def run_aggregate_query(query, aggregates, resource) do
-    AshSql.AggregateQuery.run_aggregate_query(
-      query,
-      aggregates,
-      resource,
-      AshSqlite.SqlImplementation
-    )
+    bind_tenant(resource, query_tenant(query), fn ->
+      AshSql.AggregateQuery.run_aggregate_query(
+        query,
+        aggregates,
+        resource,
+        AshSqlite.SqlImplementation
+      )
+    end)
   end
 
   @impl true
   def run_query(query, resource) do
+    bind_tenant(resource, query_tenant(query), fn -> do_run_query(query, resource) end)
+  end
+
+  defp do_run_query(query, resource) do
     with_sort_applied =
       if query.__ash_bindings__[:sort_applied?] do
         {:ok, query}
@@ -660,6 +675,14 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def bulk_create(resource, stream, options) do
+    stream = Enum.to_list(stream)
+
+    bind_tenant(resource, changesets_tenant(stream), fn ->
+      do_bulk_create(resource, stream, options)
+    end)
+  end
+
+  defp do_bulk_create(resource, stream, options) do
     # Cell-wise default values are not supported on INSERT statements by SQLite
     # This requires that we group changesets by what attributes are changing
     # And *omit* any defaults instead of using something like `(1, 2, DEFAULT)`
@@ -1370,6 +1393,10 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def upsert(resource, changeset, keys \\ nil) do
+    bind_tenant(resource, changeset.tenant, fn -> do_upsert(resource, changeset, keys) end)
+  end
+
+  defp do_upsert(resource, changeset, keys) do
     keys = keys || Ash.Resource.Info.primary_key(keys)
 
     touch_update_defaults? =
@@ -1518,6 +1545,10 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def update(resource, changeset) do
+    bind_tenant(resource, changeset.tenant, fn -> do_update(resource, changeset) end)
+  end
+
+  defp do_update(resource, changeset) do
     source = resolve_source(resource, changeset)
 
     query =
@@ -1574,6 +1605,10 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def destroy(resource, %{data: record} = changeset) do
+    bind_tenant(resource, changeset.tenant, fn -> do_destroy(resource, record, changeset) end)
+  end
+
+  defp do_destroy(resource, record, changeset) do
     source = resolve_source(resource, changeset)
 
     query =
@@ -1648,6 +1683,12 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def update_query(query, changeset, resource, options) do
+    bind_tenant(resource, changeset.tenant, fn ->
+      do_update_query(query, changeset, resource, options)
+    end)
+  end
+
+  defp do_update_query(query, changeset, resource, options) do
     repo = AshSql.dynamic_repo(resource, AshSqlite.SqlImplementation, changeset)
 
     ecto_changeset =
@@ -1773,6 +1814,12 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def destroy_query(query, changeset, resource, options) do
+    bind_tenant(resource, changeset.tenant, fn ->
+      do_destroy_query(query, changeset, resource, options)
+    end)
+  end
+
+  defp do_destroy_query(query, changeset, resource, options) do
     repo = AshSql.dynamic_repo(resource, AshSqlite.SqlImplementation, changeset)
 
     ecto_changeset =
@@ -2150,6 +2197,63 @@ defmodule AshSqlite.DataLayer do
       raise """
       Could not determine table for #{operation} on #{inspect(resource)}.
       """
+    end
+  end
+
+  # Wraps a statement in the resource's tenant binder, if it has one and this
+  # statement has a tenant. Every callback that issues SQL goes through here, which
+  # is the point: a caller cannot bind around a path it never sees, and two of the
+  # paths that matter -- aggregates and atomic writes -- give it nothing to bind
+  # around.
+  defp bind_tenant(resource, nil, fun), do: unbound(resource, fun)
+
+  defp bind_tenant(resource, tenant, fun) do
+    case AshSqlite.DataLayer.Info.tenant_binder(resource) do
+      nil -> unbound(resource, fun)
+      binder -> binder.bind(tenant, fun)
+    end
+  end
+
+  # A tenanted resource whose data layer chooses connections per tenant, reached
+  # with no tenant, would run against whichever connection the process happens to
+  # hold. For a database-per-tenant layout that is another tenant's data, so it
+  # fails rather than guesses. Ash enforces "tenant required unless global?" itself;
+  # this catches the paths that bypass an action.
+  defp unbound(resource, fun) do
+    if AshSqlite.DataLayer.Info.tenant_binder(resource) &&
+         Ash.Resource.Info.multitenancy_strategy(resource) == :context &&
+         !Ash.Resource.Info.multitenancy_global?(resource) do
+      raise ArgumentError, """
+      #{inspect(resource)} has a tenant_binder and `strategy :context`, but this \
+      statement carried no tenant.
+
+      There is no connection to select without one, and running on whatever the \
+      process happens to have bound would be another tenant's database. Pass a \
+      tenant, or set `global? true` if this resource is genuinely shared.
+      """
+    end
+
+    fun.()
+  end
+
+  defp query_tenant(%{__ash_bindings__: %{context: context}}) do
+    get_in(context, [:private, :tenant])
+  end
+
+  defp query_tenant(_), do: nil
+
+  # A bulk operation is one statement per group, so every changeset in it has to
+  # agree on the tenant. Ash builds batches per action and per tenant, so a mixed
+  # batch is a bug elsewhere -- but this is the last place it could be caught
+  # before rows land in the wrong database.
+  defp changesets_tenant(changesets) do
+    changesets
+    |> Enum.map(& &1.tenant)
+    |> Enum.uniq()
+    |> case do
+      [] -> nil
+      [tenant] -> tenant
+      many -> raise ArgumentError, "bulk operation mixes tenants: #{inspect(many)}"
     end
   end
 
