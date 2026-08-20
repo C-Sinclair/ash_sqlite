@@ -23,6 +23,11 @@ defmodule AshSqlite.DataLayer.Info do
     Extension.get_opt(resource, [:sqlite], :tenant_binder, nil, true)
   end
 
+  @doc "Whether this resource's actions may be wrapped in a transaction"
+  def transactions?(resource) do
+    Extension.get_opt(resource, [:sqlite], :transactions?, false, true)
+  end
+
   @doc "The configured table for a resource"
   def table(resource) do
     Extension.get_opt(resource, [:sqlite], :table, nil, true)
