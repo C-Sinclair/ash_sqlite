@@ -609,7 +609,7 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def run_aggregate_query(query, aggregates, resource) do
-    bind_tenant(resource, query_tenant(query), fn ->
+    bind_tenant(resource, query_tenant(query), :read, fn ->
       AshSql.AggregateQuery.run_aggregate_query(
         query,
         aggregates,
@@ -621,7 +621,7 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def run_query(query, resource) do
-    bind_tenant(resource, query_tenant(query), fn -> do_run_query(query, resource) end)
+    bind_tenant(resource, query_tenant(query), :read, fn -> do_run_query(query, resource) end)
   end
 
   defp do_run_query(query, resource) do
@@ -690,7 +690,7 @@ defmodule AshSqlite.DataLayer do
   def bulk_create(resource, stream, options) do
     stream = Enum.to_list(stream)
 
-    bind_tenant(resource, changesets_tenant(stream), fn ->
+    bind_tenant(resource, changesets_tenant(stream), :write, fn ->
       do_bulk_create(resource, stream, options)
     end)
   end
@@ -1406,7 +1406,7 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def upsert(resource, changeset, keys \\ nil) do
-    bind_tenant(resource, changeset.tenant, fn -> do_upsert(resource, changeset, keys) end)
+    bind_tenant(resource, changeset.tenant, :write, fn -> do_upsert(resource, changeset, keys) end)
   end
 
   defp do_upsert(resource, changeset, keys) do
@@ -1558,7 +1558,7 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def update(resource, changeset) do
-    bind_tenant(resource, changeset.tenant, fn -> do_update(resource, changeset) end)
+    bind_tenant(resource, changeset.tenant, :write, fn -> do_update(resource, changeset) end)
   end
 
   defp do_update(resource, changeset) do
@@ -1618,7 +1618,7 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def destroy(resource, %{data: record} = changeset) do
-    bind_tenant(resource, changeset.tenant, fn -> do_destroy(resource, record, changeset) end)
+    bind_tenant(resource, changeset.tenant, :write, fn -> do_destroy(resource, record, changeset) end)
   end
 
   defp do_destroy(resource, record, changeset) do
@@ -1696,7 +1696,7 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def update_query(query, changeset, resource, options) do
-    bind_tenant(resource, changeset.tenant, fn ->
+    bind_tenant(resource, changeset.tenant, :write, fn ->
       do_update_query(query, changeset, resource, options)
     end)
   end
@@ -1827,7 +1827,7 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def destroy_query(query, changeset, resource, options) do
-    bind_tenant(resource, changeset.tenant, fn ->
+    bind_tenant(resource, changeset.tenant, :write, fn ->
       do_destroy_query(query, changeset, resource, options)
     end)
   end
@@ -2249,7 +2249,7 @@ defmodule AshSqlite.DataLayer do
         timeout -> [mode: mode, timeout: timeout]
       end
 
-    bind_tenant(resource, tenant, fn -> repo.transaction(func, opts) end)
+    bind_tenant(resource, tenant, :transaction, fn -> repo.transaction(func, opts) end)
   end
 
   # Ash forwards no tenant of its own, so this digs it out of what it does
@@ -2299,9 +2299,14 @@ defmodule AshSqlite.DataLayer do
   # is the point: a caller cannot bind around a path it never sees, and two of the
   # paths that matter -- aggregates and atomic writes -- give it nothing to bind
   # around.
-  defp bind_tenant(resource, nil, fun), do: unbound(resource, fun)
+  #
+  # `usage` is what this callback is: `:read`, `:write`, or `:transaction`. Only
+  # this module can say -- by the time a binder sees a statement the distinction is
+  # gone -- and a binder that caches, replicates, or routes reads separately from
+  # writes cannot be written without it.
+  defp bind_tenant(resource, nil, _usage, fun), do: unbound(resource, fun)
 
-  defp bind_tenant(resource, tenant, fun) do
+  defp bind_tenant(resource, tenant, usage, fun) do
     case AshSqlite.DataLayer.Info.tenant_binder(resource) do
       nil ->
         unbound(resource, fun)
@@ -2313,7 +2318,7 @@ defmodule AshSqlite.DataLayer do
         # *this* connection, so a statement that binds elsewhere leaves it.
         enclosing = if in_transaction?(resource), do: repo.get_dynamic_repo()
 
-        binder.bind(tenant, fn ->
+        binder.bind(tenant, [resource: resource, usage: usage], fn ->
           if enclosing && repo.get_dynamic_repo() != enclosing do
             raise ArgumentError, """
             #{inspect(resource)} tried to run a statement for tenant \
