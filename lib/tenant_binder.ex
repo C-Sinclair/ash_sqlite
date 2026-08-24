@@ -8,6 +8,8 @@ defmodule AshSqlite.TenantBinder do
 
   Under `strategy :context` each tenant has its own database file. The SQL is the
   same for every tenant, and the tenant is applied by choosing the connection.
+
+  Defaults to `AshSqlite.MultiTenancy.Binder`; name your own to replace it.
   """
 
   @typedoc """

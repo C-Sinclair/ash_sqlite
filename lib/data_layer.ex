@@ -315,8 +315,7 @@ defmodule AshSqlite.DataLayer do
       AshSqlite.Transformers.CarryTenant
     ],
     verifiers: [
-      AshSqlite.Verifiers.VerifyGlobalMultitenancy,
-      AshSqlite.Verifiers.VerifyTenantBinder
+      AshSqlite.Verifiers.VerifyGlobalMultitenancy
     ]
 
   def migrate(args) do
@@ -2264,7 +2263,7 @@ defmodule AshSqlite.DataLayer do
   defp bind_to_tenant(resource, tenant, usage, fun) do
     case AshSqlite.DataLayer.Info.tenant_binder(resource) do
       nil ->
-        without_binder(resource, tenant, fun)
+        unbound(resource, fun)
 
       binder ->
         repo = AshSqlite.DataLayer.Info.repo(resource, :mutate)
@@ -2298,26 +2297,6 @@ defmodule AshSqlite.DataLayer do
       raise ArgumentError, """
       #{inspect(resource)} has `strategy :context` but this statement carried no \
       tenant, so there is no database file to select. Pass a tenant.
-      """
-    end
-
-    fun.()
-  end
-
-  # `strategy :context` and no binder is a configuration error rather than a
-  # statement to run unbound. `VerifyTenantBinder` fails the compile, so this is
-  # reached only by a resource built at runtime.
-  defp without_binder(resource, tenant, fun) do
-    if Ash.Resource.Info.multitenancy_strategy(resource) == :context do
-      raise ArgumentError, """
-      #{inspect(resource)} has `strategy :context` and a tenant of \
-      #{inspect(tenant)}, but no `tenant_binder` to select a connection with.
-
-          sqlite do
-            tenant_binder MyApp.TenantBinder
-          end
-
-      See `AshSqlite.TenantBinder`.
       """
     end
 
