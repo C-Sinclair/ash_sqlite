@@ -312,7 +312,8 @@ defmodule AshSqlite.DataLayer do
       AshSqlite.Transformers.ValidateReferences,
       AshSqlite.Transformers.VerifyRepo,
       AshSqlite.Transformers.EnsureTableOrPolymorphic,
-      AshSqlite.Transformers.CarryTenant
+      AshSqlite.Transformers.CarryTenant,
+      AshSqlite.Transformers.VerifyTenantRepo
     ],
     verifiers: [
       AshSqlite.Verifiers.VerifyGlobalMultitenancy
