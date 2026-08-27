@@ -205,7 +205,6 @@ defmodule AshSqlite.DataLayer do
       ],
       write_transactions?: [
         type: :boolean,
-        default: false,
         doc: """
         Whether Ash may wrap this resource's write actions in a transaction.
 
