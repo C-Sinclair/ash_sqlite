@@ -203,23 +203,24 @@ defmodule AshSqlite.DataLayer do
         doc:
           "The repo that will be used to fetch your data. See the `AshSqlite.Repo` documentation for more. Can also be a function that takes a resource and a type `:read | :mutate` and returns the repo."
       ],
+      write_transactions?: [
+        type: :boolean,
+        doc: """
+        Whether Ash may wrap this resource's write actions in a transaction.
+
+        Off by default. SQLite allows a single write lock at a time and a
+        contended write fails immediately rather than queueing, so transactions
+        are only safe once the repo is configured for them. See the
+        [transactions guide](/documentation/topics/about-ash-sqlite/transactions.md).
+
+        With this on, write transactions are opened as `BEGIN IMMEDIATE` so that
+        `busy_timeout` can do its job.
+        """
+      ],
       tenant_binder: [
         type: {:behaviour, AshSqlite.TenantBinder},
         doc:
           "A module that selects the connection a tenanted statement runs on. Required for database-per-tenant layouts, where the tenant is a database file rather than a query prefix. See `AshSqlite.TenantBinder`."
-      ],
-      transactions?: [
-        type: :boolean,
-        doc: """
-        Whether Ash may wrap this resource's actions in a transaction.
-
-        Defaults to `false`. Deliberately has no schema default, so that an
-        extension can tell "not set" from "set to `false`" and only fill in the
-        former. SQLite allows one writer at a time and a contended write
-        fails rather than queueing, so transactions are only safe once the repo is
-        configured for it -- see the transactions guide. With this on, writes are
-        issued as `BEGIN IMMEDIATE` so that `busy_timeout` can do its job.
-        """
       ],
       migrate?: [
         type: :boolean,
@@ -324,7 +325,9 @@ defmodule AshSqlite.DataLayer do
     transformers: [
       AshSqlite.Transformers.ValidateReferences,
       AshSqlite.Transformers.VerifyRepo,
-      AshSqlite.Transformers.EnsureTableOrPolymorphic
+      AshSqlite.Transformers.EnsureTableOrPolymorphic,
+      AshSqlite.Transformers.CarryTenant,
+      AshSqlite.Transformers.VerifyTenantRepo
     ]
 
   def migrate(args) do
@@ -465,7 +468,7 @@ defmodule AshSqlite.DataLayer do
   def can?(_, :destroy_query), do: true
   def can?(_, {:lock, _}), do: false
 
-  def can?(resource, :transact), do: AshSqlite.DataLayer.Info.transactions?(resource)
+  def can?(resource, :transact), do: AshSqlite.DataLayer.Info.write_transactions?(resource)
   def can?(_, :composite_primary_key), do: true
   def can?(_, {:atomic, :update}), do: true
   def can?(_, {:atomic, :upsert}), do: true
@@ -533,28 +536,9 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   @doc """
-  Context multitenancy for SQLite means **one database per tenant**.
-
-  SQLite has no schemas, so unlike `AshPostgres` there is no query prefix to
-  set and the generated SQL is identical for every tenant. Isolation comes from
-  which database file the connection is attached to.
-
-  This callback is therefore a no-op on the query itself. It exists so that
-  `strategy :context` resources are accepted and so Ash enforces its own
-  "tenant is required unless `global?`" rule.
-
-  The connection is chosen separately, per statement, by the resource's
-  `tenant_binder` — see `AshSqlite.TenantBinder`. The tenant reaches that code by
-  a different route: Ash puts it in the query context (`private.tenant`), which
-  `set_context/3` stores in `__ash_bindings__`, and writes carry it on the
-  changeset.
-
-  > #### Isolation is not enforced here {: .warning}
-  >
-  > Declaring `strategy :context` does **not** by itself separate tenants. Without
-  > a `tenant_binder` every tenant resolves to whatever connection the calling
-  > process holds, so every tenant may share one table and nothing here will say
-  > so. The binder is what makes the declaration mean something.
+  A no-op on the query: with one database per tenant there is no prefix to set.
+  The connection is chosen per statement by the resource's `tenant_binder`
+  instead.   
   """
   def set_tenant(_resource, query, _tenant) do
     {:ok, query}
@@ -1618,7 +1602,9 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def destroy(resource, %{data: record} = changeset) do
-    bind_tenant(resource, changeset.tenant, :write, fn -> do_destroy(resource, record, changeset) end)
+    bind_tenant(resource, changeset.tenant, :write, fn ->
+      do_destroy(resource, record, changeset)
+    end)
   end
 
   defp do_destroy(resource, record, changeset) do
@@ -2193,21 +2179,20 @@ defmodule AshSqlite.DataLayer do
   def in_transaction?(resource) do
     repo = AshSqlite.DataLayer.Info.repo(resource, :mutate)
 
-    # Ash asks this *before* opening a transaction, on a process that may have
-    # nothing bound. A repo reached only through `put_dynamic_repo/1` is never
-    # started under its module name, and `Ecto.Repo.in_transaction?/0` looks the
-    # current dynamic repo up in the registry and raises when it is missing. No
-    # repo means no transaction, which is an answer rather than an error.
+    # Ash asks this before opening a transaction, and the answer has to be an
+    # answer rather than an exception. `Ecto.Repo.in_transaction?/0` resolves the
+    # current dynamic repo through the registry and raises when it is not there,
+    # which happens whenever the repo was reached through
+    # `c:Ecto.Repo.put_dynamic_repo/1` and started under no name of its own. No
+    # running repo means no open transaction.
     case repo.get_dynamic_repo() do
       pid when is_pid(pid) -> repo.in_transaction?()
       name when is_atom(name) -> !is_nil(GenServer.whereis(name)) and repo.in_transaction?()
     end
   end
 
-  # An atomic update is a single statement and so already atomic; wrapping it in a
-  # transaction would hold SQLite's one write lock for longer and buy nothing.
-  # Ash also builds it without a changeset, so there would be no context to carry
-  # a tenant in -- see `transaction/4`.
+  # An atomic update is a single statement, so it is already atomic. Wrapping it
+  # would hold SQLite's one write lock across the surrounding work and buy nothing.
   @impl true
   def prefer_transaction_for_atomic_updates?(_resource), do: false
 
@@ -2215,8 +2200,8 @@ defmodule AshSqlite.DataLayer do
   def transaction(resource, func, timeout \\ nil, reason \\ %{type: :custom, metadata: %{}}) do
     repo = AshSqlite.DataLayer.Info.repo(resource, :mutate)
 
-    # Ash calls this above the data layer, so the tenant cannot come from a
-    # changeset the way it does for every other callback.
+    # Ash calls this above the data layer, so unlike every other callback there is
+    # no changeset here to read the tenant off.
     tenant = reason_tenant(reason)
 
     if is_nil(tenant) and tenant_required?(resource) do
@@ -2224,10 +2209,9 @@ defmodule AshSqlite.DataLayer do
       #{inspect(resource)} has a tenant_binder and `strategy :context`, but the \
       transaction about to be opened for this action carried no tenant.
 
-      A transaction has to be opened on one connection, and for a \
-      database-per-tenant layout that means one tenant's database. Ash forwards \
-      only the changeset's data layer context to this callback, so the tenant has \
-      to travel in it:
+      A transaction is opened on one connection, and for a database-per-tenant \
+      layout that means one tenant's database. Ash forwards only the changeset's \
+      data layer context to this callback, so the tenant has to travel in it:
 
           Ash.Changeset.set_context(changeset, %{data_layer: %{tenant: tenant}})
 
@@ -2236,10 +2220,11 @@ defmodule AshSqlite.DataLayer do
     end
 
     # A read takes no write lock, so it stays deferred. Anything that may write
-    # takes the write lock up front: a deferred transaction that reads and then
-    # writes has to upgrade its lock, and an upgrade cannot wait for
-    # `busy_timeout` -- the snapshot it holds may already be stale, so SQLite
-    # fails it immediately. `BEGIN IMMEDIATE` has nothing to upgrade.
+    # takes the write lock up front, because a deferred transaction that reads and
+    # then writes has to *upgrade* its lock -- and SQLite cannot make an upgrade
+    # wait for `busy_timeout`, since the snapshot the transaction already read from
+    # may be stale by the time the lock frees. It fails immediately instead.
+    # `BEGIN IMMEDIATE` has nothing to upgrade, so `busy_timeout` applies.
     mode = if reason[:type] == :read, do: :deferred, else: :immediate
 
     opts =
@@ -2304,9 +2289,98 @@ defmodule AshSqlite.DataLayer do
   # this module can say -- by the time a binder sees a statement the distinction is
   # gone -- and a binder that caches, replicates, or routes reads separately from
   # writes cannot be written without it.
-  defp bind_tenant(resource, nil, _usage, fun), do: unbound(resource, fun)
-
   defp bind_tenant(resource, tenant, usage, fun) do
+    cond do
+      global?(resource) -> bind_global(resource, fun)
+      is_nil(tenant) -> unbound(resource, fun)
+      true -> bind_to_tenant(resource, tenant, usage, fun)
+    end
+  end
+
+  # A `global?` resource holds one copy of its rows, not one per tenant. No tenant
+  # selects its database, so the binder is never asked and a tenant passed to it is
+  # ignored rather than honoured -- honouring it is what gave every tenant its own
+  # copy of a table that is supposed to have exactly one.
+  #
+  # It binds the resource's repo module to its *own* named instance, explicitly. The
+  # alternative is to leave the process binding alone, which is what made this a
+  # footgun: a global resource sharing a repo module with tenanted ones read whichever
+  # tenant happened to be bound last. Which database the global rows live in follows
+  # from `repo` -- the tenanted module's own configured database if it shares one,
+  # another module's if it names one -- and in neither case from the caller.
+  defp bind_global(resource, fun) do
+    repo = AshSqlite.DataLayer.Info.repo(resource, :mutate)
+    verify_shared_repo!(resource, repo)
+    previous = repo.get_dynamic_repo()
+
+    if previous == repo do
+      fun.()
+    else
+      repo.put_dynamic_repo(repo)
+
+      try do
+        fun.()
+      after
+        repo.put_dynamic_repo(previous)
+      end
+    end
+  end
+
+  # Checked here rather than by a transformer, because it cannot be known at compile
+  # time. A repo's `database:` is very often set in `config/runtime.exs` -- that is
+  # the recommended shape for a release -- and a transformer runs long before that
+  # file is evaluated, so it would reject exactly the configuration it should accept.
+  # Ecto's own error for this names the repo but not the reason a `global?` resource
+  # wanted it, which is the part worth saying.
+  defp verify_shared_repo!(resource, repo) do
+    cond do
+      is_nil(Process.whereis(repo)) ->
+        raise ArgumentError, shared_repo_error(resource, repo, "is not running")
+
+      is_nil(repo.config()[:database]) ->
+        raise ArgumentError, shared_repo_error(resource, repo, "has no `database:` set")
+
+      true ->
+        :ok
+    end
+  end
+
+  # Both halves are checked, because neither implies the other and the failure
+  # without them is unrecognisable. A repo module serving only tenants is reached
+  # through `Ecto.Repo.put_dynamic_repo/1`, so it needs no name and no database of
+  # its own -- and it starts happily without either. A global statement on one then
+  # waits out the pool timeout and reports that requests are arriving faster than
+  # they can be served, which is not what went wrong.
+  defp shared_repo_error(resource, repo, problem) do
+    """
+    #{inspect(resource)} has `strategy :context` with `global? true`, so its rows \
+    live in one shared database rather than one per tenant -- #{inspect(repo)}'s own, \
+    under its own name. That repo #{problem}.
+
+    A repo module used only for tenants needs neither, which is what makes this easy \
+    to arrive at by adding `global? true` to a resource on one. Give it a database \
+    and start it:
+
+        config :my_app, #{inspect(repo)}, database: "priv/shared.db"
+
+        children = [
+          #{inspect(repo)},
+          {AshSqlite.MultiTenancy, repo: #{inspect(repo)}, dir: "priv/tenants"}
+        ]
+
+    Or put the shared tables on a repo module of their own and name it in this \
+    resource's `repo`. What will not work is neither: there is no tenant to fall \
+    back to, and falling back to one would put a shared table in a single tenant's \
+    database.
+    """
+  end
+
+  defp global?(resource) do
+    Ash.Resource.Info.multitenancy_strategy(resource) == :context &&
+      Ash.Resource.Info.multitenancy_global?(resource)
+  end
+
+  defp bind_to_tenant(resource, tenant, usage, fun) do
     case AshSqlite.DataLayer.Info.tenant_binder(resource) do
       nil ->
         unbound(resource, fun)
@@ -2322,13 +2396,9 @@ defmodule AshSqlite.DataLayer do
           if enclosing && repo.get_dynamic_repo() != enclosing do
             raise ArgumentError, """
             #{inspect(resource)} tried to run a statement for tenant \
-            #{inspect(tenant)} inside a transaction that is open on a different \
-            tenant's database.
-
-            Each tenant is a separate SQLite file with its own connection, and \
-            SQLite cannot commit across database files atomically in WAL mode. \
-            This statement would run outside the enclosing transaction, commit on \
-            its own, and survive a rollback of everything around it.
+            #{inspect(tenant)} inside a transaction open on another tenant's \
+            database. SQLite cannot commit across files atomically in WAL mode, so \
+            this statement would commit on its own and survive a rollback.
 
             Open one transaction per tenant instead.
             """
@@ -2347,12 +2417,9 @@ defmodule AshSqlite.DataLayer do
   defp unbound(resource, fun) do
     if tenant_required?(resource) do
       raise ArgumentError, """
-      #{inspect(resource)} has a tenant_binder and `strategy :context`, but this \
-      statement carried no tenant.
-
-      There is no connection to select without one, and running on whatever the \
-      process happens to have bound would be another tenant's database. Pass a \
-      tenant, or set `global? true` if this resource is genuinely shared.
+      #{inspect(resource)} has `strategy :context` but this statement carried no \
+      tenant, so there is no connection to select. Pass a tenant, or set \
+      `global? true` if this resource is genuinely shared.
       """
     end
 
@@ -2360,8 +2427,7 @@ defmodule AshSqlite.DataLayer do
   end
 
   defp tenant_required?(resource) do
-    !!AshSqlite.DataLayer.Info.tenant_binder(resource) &&
-      Ash.Resource.Info.multitenancy_strategy(resource) == :context &&
+    Ash.Resource.Info.multitenancy_strategy(resource) == :context &&
       !Ash.Resource.Info.multitenancy_global?(resource)
   end
 
@@ -2371,10 +2437,6 @@ defmodule AshSqlite.DataLayer do
 
   defp query_tenant(_), do: nil
 
-  # A bulk operation is one statement per group, so every changeset in it has to
-  # agree on the tenant. Ash builds batches per action and per tenant, so a mixed
-  # batch is a bug elsewhere -- but this is the last place it could be caught
-  # before rows land in the wrong database.
   defp changesets_tenant(changesets) do
     changesets
     |> Enum.map(& &1.tenant)

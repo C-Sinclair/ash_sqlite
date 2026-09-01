@@ -17,62 +17,51 @@ Because of this, **AshSqlite disables transaction support by default**
 (`can?(:transact)` returns `false`). Without extra configuration, Ash will not
 wrap actions in transactions when using the SQLite data layer.
 
-That default is about contention, not capability. SQLite is fully ACID, and a
-multi-step action that cannot roll back is its own kind of problem: a create whose
-`after_action` hook fails leaves the row behind. Once the repo is configured as
-below, turn transactions on per resource:
+## Enabling Transactions
+
+Transactions are opt in per resource, via `write_transactions?` in the `sqlite`
+block:
 
 ```elixir
 sqlite do
+  table "accounts"
   repo MyApp.Repo
-  table "posts"
-  transactions? true
+  write_transactions? true
 end
 ```
 
-## What turning it on does
+Turning this on is worth it wherever an action does more than one thing. Without
+a transaction, a create whose `after_action` hook fails leaves its record behind:
+the insert already committed on its own, and there is nothing to undo it. With
+one, the failure rolls the insert back.
 
-- **Writes are issued as `BEGIN IMMEDIATE`.** This is the part that makes
-  `busy_timeout` work. A deferred transaction that reads and then writes has to
-  *upgrade* its lock, and SQLite cannot make an upgrade wait — the snapshot the
-  transaction already holds may be stale, so it fails immediately with
-  `SQLITE_BUSY` no matter how long `busy_timeout` is. An immediate transaction has
-  nothing to upgrade, so contention becomes waiting rather than failing. Read
-  transactions stay deferred, since they take no write lock.
+Ash derives `transaction? true` on create, update and destroy actions, and then
+clears it again on a resource whose data layer cannot transact. So on a resource
+that has not opted in, `Ash.Resource.Info.action(MyApp.Post, :create).transaction?`
+reads `false` and says what will really happen, rather than naming a transaction
+the data layer was never going to open. Turning `write_transactions?` on is what
+lets that default stand.
 
-- **Atomic updates are left alone.** `c:Ash.DataLayer.prefer_transaction_for_atomic_updates?/1`
-  is `false`: an atomic update is a single statement and so already atomic, and
-  wrapping it would hold the one write lock for longer while buying nothing.
-  `require_atomic? true` actions are unaffected.
+Read it as a statement about the *repo*, not just the resource — a resource only
+transacts safely once the repo underneath it is configured as below. Leaving it
+off is not a bug, and it stays the default so that existing applications are
+unaffected.
 
-## Database-per-tenant
-
-With a `tenant_binder` (see `AshSqlite.TenantBinder`) each tenant is a separate
-database file on its own connection, and a transaction lives on exactly one
-connection. Two consequences:
-
-- **A transaction cannot span tenants.** SQLite *can* commit atomically across
-  `ATTACH`ed databases, but not when any of them is in WAL mode — then each
-  database commits atomically on its own, not as a set. A statement for another
-  tenant inside an open transaction is refused rather than silently committing
-  independently and surviving a rollback of everything around it.
-
-- **The tenant has to reach `c:Ash.DataLayer.transaction/4`.** Ash calls it above
-  the data layer, so unlike every other callback there is no changeset or query to
-  read the tenant from. Ash forwards the changeset's data layer context, so put it
-  there — a global change on the resource is the usual place:
-
-  ```elixir
-  Ash.Changeset.set_context(changeset, %{data_layer: %{tenant: changeset.tenant}})
-  ```
-
-  Reads need nothing: their transaction reason carries the query, which already
-  has the tenant on it. A tenanted resource whose transaction arrives without one
-  raises, rather than opening a transaction against an arbitrary database.
-
-The single-writer objection also mostly dissolves in this layout: one file per
-tenant with `pool_size: 1` means a second writer for the same tenant waits for a
-connection instead of reaching SQLite's write lock at all.
+> ### Transactions are opened as IMMEDIATE {: .info}
+>
+> When a write transaction is opened, AshSqlite issues `BEGIN IMMEDIATE` rather
+> than letting it default to deferred, whatever `default_transaction_mode` is set
+> to. This is what makes `busy_timeout` effective for transactions that read
+> before they write.
+>
+> A deferred transaction takes no lock until its first write, so a
+> read-then-write has to *upgrade* to the write lock partway through. SQLite
+> cannot make an upgrade wait: the snapshot the transaction already read from may
+> be stale by the time the lock frees, so it fails immediately no matter how long
+> `busy_timeout` is. `BEGIN IMMEDIATE` takes the lock up front, and has nothing to
+> upgrade.
+>
+> Read-only transactions stay deferred, since they never take the write lock.
 
 ## Enabling Reliable Concurrent Writes
 

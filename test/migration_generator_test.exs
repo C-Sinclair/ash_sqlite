@@ -54,6 +54,31 @@ defmodule AshSqlite.MigrationGeneratorTest do
     end
   end
 
+  defmacrop defresource(mod, table, do: body) do
+    quote do
+      Code.compiler_options(ignore_module_conflict: true)
+
+      defmodule unquote(mod) do
+        use Ash.Resource,
+          domain: nil,
+          data_layer: AshSqlite.DataLayer
+
+        sqlite do
+          table unquote(table)
+          repo(AshSqlite.TestRepo)
+        end
+
+        actions do
+          defaults([:create, :read, :update, :destroy])
+        end
+
+        unquote(body)
+      end
+
+      Code.compiler_options(ignore_module_conflict: false)
+    end
+  end
+
   defmacrop defdomain(resources) do
     quote do
       Code.compiler_options(ignore_module_conflict: true)
@@ -157,6 +182,62 @@ defmodule AshSqlite.MigrationGeneratorTest do
       # the migration creates unique_indexes using the `source` on the attributes of the identity on the resource
       assert file_contents =~
                ~S{create unique_index(:posts, [:title, :t_w_s], name: "posts_thing_with_source_index")}
+    end
+  end
+
+  describe "creating initial snapshots for resources with attribute multitenancy" do
+    setup %{snapshot_path: snapshot_path, migration_path: migration_path} do
+      defposts do
+        sqlite do
+          custom_indexes do
+            index([:organization_id, :name], name: "posts_custom_tenant_index")
+          end
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:organization_id)
+        end
+
+        identities do
+          identity(:unique_name_per_org, [:organization_id, :name])
+        end
+
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:name, :string)
+          attribute(:organization_id, :uuid)
+        end
+      end
+
+      defdomain([Post])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      :ok
+    end
+
+    test "identity keys that include the tenant attribute are not duplicated", %{
+      migration_path: migration_path
+    } do
+      assert [file] = Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs")
+
+      file_contents = File.read!(file)
+
+      assert file_contents =~
+               ~S{create unique_index(:posts, [:organization_id, :name], name: "posts_unique_name_per_org_index")}
+
+      assert file_contents =~
+               ~S{create index(:posts, ["organization_id", "name"], name: "posts_custom_tenant_index")}
+
+      refute file_contents =~ ~S{:organization_id, :organization_id}
+      refute file_contents =~ ~S{"organization_id", "organization_id"}
     end
   end
 
@@ -837,6 +918,394 @@ defmodule AshSqlite.MigrationGeneratorTest do
 
       assert down_code =~ ~S[raise "SQLite does not support dropping foreign key constraints.]
       assert down_code =~ ~S[new_post_fkey]
+    end
+  end
+
+  describe "multitenant references" do
+    setup do: :ok
+
+    test "references to the primary key do not include the tenant attribute by default", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defresource Org, "orgs" do
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:id)
+        end
+      end
+
+      defresource User, "users" do
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:org_id)
+        end
+
+        relationships do
+          belongs_to(:org, Org) do
+            public?(true)
+          end
+        end
+      end
+
+      defresource UserThing, "user_things" do
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:org_id)
+        end
+
+        relationships do
+          belongs_to(:org, Org) do
+            public?(true)
+          end
+
+          belongs_to(:user, User) do
+            public?(true)
+          end
+        end
+      end
+
+      defdomain([Org, User, UserThing])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [file] = Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs")
+
+      contents = File.read!(file)
+
+      assert contents =~
+               ~S{references(:users, column: :id, name: "user_things_user_id_fkey", type: :uuid)}
+
+      refute contents =~ ~S{with: [org_id: :org_id]}
+    end
+
+    test "match_tenant? includes the tenant attribute when the destination has a matching unique index",
+         %{
+           snapshot_path: snapshot_path,
+           migration_path: migration_path
+         } do
+      defresource Org, "orgs" do
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:id)
+        end
+      end
+
+      defresource User, "users" do
+        sqlite do
+          custom_indexes do
+            index([:id, :org_id], unique: true)
+          end
+        end
+
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:org_id)
+        end
+
+        relationships do
+          belongs_to(:org, Org) do
+            public?(true)
+          end
+        end
+      end
+
+      defresource UserThing, "user_things" do
+        sqlite do
+          references do
+            reference(:user, match_tenant?: true)
+          end
+        end
+
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:org_id)
+        end
+
+        relationships do
+          belongs_to(:org, Org) do
+            public?(true)
+          end
+
+          belongs_to(:user, User) do
+            public?(true)
+          end
+        end
+      end
+
+      defdomain([Org, User, UserThing])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [file] = Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs")
+
+      assert File.read!(file) =~
+               ~S{references(:users, column: :id, with: [org_id: :org_id], match: :full, name: "user_things_user_id_fkey", type: :uuid)}
+    end
+
+    test "match_tenant? without a matching unique index on the destination raises", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defresource Org, "orgs" do
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:id)
+        end
+      end
+
+      defresource User, "users" do
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:org_id)
+        end
+
+        relationships do
+          belongs_to(:org, Org) do
+            public?(true)
+          end
+        end
+      end
+
+      defresource UserThing, "user_things" do
+        sqlite do
+          references do
+            reference(:user, match_tenant?: true)
+          end
+        end
+
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:org_id)
+        end
+
+        relationships do
+          belongs_to(:org, Org) do
+            public?(true)
+          end
+
+          belongs_to(:user, User) do
+            public?(true)
+          end
+        end
+      end
+
+      defdomain([Org, User, UserThing])
+
+      assert_raise RuntimeError, ~r/UNIQUE index/, fn ->
+        AshSqlite.MigrationGenerator.generate(Domain,
+          snapshot_path: snapshot_path,
+          migration_path: migration_path,
+          quiet: true,
+          format: false,
+          auto_name: true
+        )
+      end
+    end
+
+    test "references to a non-primary-key attribute include the tenant attribute when covered by an identity",
+         %{
+           snapshot_path: snapshot_path,
+           migration_path: migration_path
+         } do
+      defresource Org, "orgs" do
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:id)
+        end
+      end
+
+      defresource User, "users" do
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:key, :uuid, allow_nil?: false, public?: true)
+        end
+
+        identities do
+          identity(:key, [:key])
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:org_id)
+        end
+
+        relationships do
+          belongs_to(:org, Org) do
+            public?(true)
+          end
+        end
+      end
+
+      defresource UserThing, "user_things" do
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:org_id)
+        end
+
+        relationships do
+          belongs_to(:org, Org) do
+            public?(true)
+          end
+
+          belongs_to(:user, User) do
+            public?(true)
+            destination_attribute(:key)
+          end
+        end
+      end
+
+      defdomain([Org, User, UserThing])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [file] = Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs")
+
+      assert File.read!(file) =~
+               ~S{references(:users, column: :key, with: [org_id: :org_id], match: :full, name: "user_things_user_id_fkey", type: :uuid)}
+    end
+
+    test "references to a non-primary-key attribute raise without a covering unique index", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defresource Org, "orgs" do
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:id)
+        end
+      end
+
+      defresource User, "users" do
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:key, :uuid, allow_nil?: false, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:org_id)
+        end
+
+        relationships do
+          belongs_to(:org, Org) do
+            public?(true)
+          end
+        end
+      end
+
+      defresource UserThing, "user_things" do
+        attributes do
+          uuid_primary_key(:id, writable?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        multitenancy do
+          strategy(:attribute)
+          attribute(:org_id)
+        end
+
+        relationships do
+          belongs_to(:org, Org) do
+            public?(true)
+          end
+
+          belongs_to(:user, User) do
+            public?(true)
+            destination_attribute(:key)
+          end
+        end
+      end
+
+      defdomain([Org, User, UserThing])
+
+      assert_raise RuntimeError, ~r/UNIQUE index/, fn ->
+        AshSqlite.MigrationGenerator.generate(Domain,
+          snapshot_path: snapshot_path,
+          migration_path: migration_path,
+          quiet: true,
+          format: false,
+          auto_name: true
+        )
+      end
     end
   end
 

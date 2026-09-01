@@ -6,8 +6,9 @@ defmodule AshSqlite.Test.TransactionalAccount do
   @moduledoc """
   Shares the `accounts` table with `AshSqlite.Test.Account`, with transactions on.
 
-  Sharing the table is the point: the two resources differ only in `transactions?`,
-  so a test can show that the same action either rolls back or does not.
+  Sharing the table is the point: the two resources differ only in
+  `write_transactions?`, so a test can show the same failure either rolling back or
+  leaving its row behind.
   """
   use Ash.Resource, domain: AshSqlite.Test.Domain, data_layer: AshSqlite.DataLayer
 
@@ -34,6 +35,6 @@ defmodule AshSqlite.Test.TransactionalAccount do
   sqlite do
     table("accounts")
     repo(AshSqlite.TestRepo)
-    transactions?(true)
+    write_transactions?(true)
   end
 end

@@ -232,6 +232,94 @@ defmodule AshSqlite.SqlImplementation do
     handle_map_comparison(query, :==, left, right, pred_embedded?, bindings, embedded?, acc, type)
   end
 
+  # `is_distinct_from` is the NULL-safe form of `!=`, and Ash emits it in place of `!=` whenever
+  # either side can be nil (see `Ash.Query.Function.IsDistinctFrom.new/1`). It needs the same
+  # JSON treatment as the two clauses above, and without it a map reaches the driver as a bare
+  # Elixir term and is rejected: `(Exqlite.Error) unsupported type: %{...}`. The clearest way to
+  # see it is one resource with two `:map` attributes, where only `allow_nil?` differs - the
+  # `allow_nil? false` one takes `!=` and updates, the nullable one takes `is_distinct_from` and
+  # raises. `update_timestamp` builds exactly this comparison, so any atomic update of a nullable
+  # map attribute is affected.
+  def expr(
+        query,
+        %Ash.Query.Function.IsDistinctFrom{
+          arguments: [left, right],
+          embedded?: pred_embedded?
+        },
+        bindings,
+        embedded?,
+        acc,
+        type
+      )
+      when is_non_struct_map(left) or is_non_struct_map(right) do
+    handle_map_comparison(
+      query,
+      :is_distinct_from,
+      left,
+      right,
+      pred_embedded?,
+      bindings,
+      embedded?,
+      acc,
+      type
+    )
+  end
+
+  def expr(
+        query,
+        %Ash.Query.Function.IsNotDistinctFrom{
+          arguments: [left, right],
+          embedded?: pred_embedded?
+        },
+        bindings,
+        embedded?,
+        acc,
+        type
+      )
+      when is_non_struct_map(left) or is_non_struct_map(right) do
+    handle_map_comparison(
+      query,
+      :is_not_distinct_from,
+      left,
+      right,
+      pred_embedded?,
+      bindings,
+      embedded?,
+      acc,
+      type
+    )
+  end
+
+  # The clauses above JSON-encode a map that is an OPERAND of a comparison, and `list_expr/6`
+  # below JSON-encodes a map that is an ELEMENT of a list. A map in any other position is still
+  # handed to the driver as a bare Elixir term, and rejected:
+  #
+  #     ** (Exqlite.Error) unsupported type: %{"k" => "v"}
+  #     SELECT ... FROM "devices" AS d0 WHERE ((json(d0."entity") = json(?)))
+  #
+  # AshSql renders a plain map specially only inside a `select` sub-expression, or inside an
+  # `update` / `aggregate` when the map CONTAINS an expression; every other position falls through
+  # to binding the map itself as a parameter. That covers a map used as a fragment argument, as a
+  # branch of an `if`, or anywhere else an expression can nest.
+  #
+  # The treatment is the one `handle_map_comparison/9` already uses for the same value: the map is
+  # data, so it is bound as its JSON text. `Jason.encode!/1` is what Ecto's SQLite adapter dumps
+  # for a `:map` column, so a map rendered here is byte-identical to the same map stored by an
+  # INSERT, and comparing one against the other is meaningful.
+  #
+  # A map that contains an expression is left alone: its values are not data, so they cannot be
+  # encoded, and AshSql's own handling of that case is unchanged.
+  def expr(query, value, bindings, embedded?, acc, type)
+      when is_non_struct_map(value) do
+    if bindings[:location] == :select or Ash.Expr.expr?(value) do
+      :error
+    else
+      {expr, acc} = as_json(query, value, false, bindings, embedded?, acc, type)
+
+      {:ok, expr, acc}
+    end
+  end
+
   @impl true
   def expr(
         _query,
@@ -243,6 +331,65 @@ defmodule AshSqlite.SqlImplementation do
       ) do
     :error
   end
+
+  # SQLite has no `ARRAY[...]` constructor, so the `ARRAY[...]` / `array_to_json(ARRAY[...])`
+  # rendering AshSql falls back to is a syntax error here:
+  #
+  #     ** (Exqlite.Error) near "[?,?]": syntax error
+  #     UPDATE "visual_machines" AS v0 SET ..., "nodes" = ARRAY[?,?]
+  #
+  # `json_array(...)` is the equivalent, and the element treatment is chosen to match what the
+  # data layer already stores for the same column. Ecto's SQLite adapter dumps an
+  # `{:array, :map}` field by JSON-encoding each element and then JSON-encoding the list, so the
+  # column holds a JSON array of JSON STRINGS:
+  #
+  #     ["{\"id\":\"n1\"}","{\"id\":\"n2\"}"]
+  #
+  # `json_array(?, ?)` with each parameter bound to `Jason.encode!(element)` produces exactly
+  # that, byte for byte, which is what makes the value round-trip through the loader and makes
+  # the `is_distinct_from` comparison against the column meaningful (a no-op write compares
+  # equal and does not bump `updated_at`).
+  #
+  # When the expected type is a JSON value rather than an array column (`:map` / `:json` /
+  # `:jsonb`, the case AshSql renders with `array_to_json`), the elements are JSON VALUES rather
+  # than strings, so they go through `json(...)`.
+  @impl true
+  def list_expr(query, value, bindings, embedded?, acc, type) do
+    json_value? = type in [:map, :jsonb, :json]
+
+    elements =
+      value
+      |> Enum.map(&list_element(&1, json_value?))
+      |> Enum.intersperse([raw: ","])
+      |> List.flatten()
+
+    {expr, acc} =
+      AshSql.Expr.dynamic_expr(
+        query,
+        %Ash.Query.Function.Fragment{
+          embedded?: embedded?,
+          arguments: [raw: "json_array("] ++ elements ++ [raw: ")"]
+        },
+        bindings,
+        embedded?,
+        type,
+        acc
+      )
+
+    {:ok, expr, acc}
+  end
+
+  # A plain map or list is data, and it is bound as its JSON text. Anything else (an expression,
+  # a column reference, a scalar) is rendered as itself.
+  defp list_element(item, json_value?) when is_list(item), do: encoded_element(item, json_value?)
+
+  defp list_element(item, json_value?) when is_map(item) and not is_struct(item),
+    do: encoded_element(item, json_value?)
+
+  defp list_element(item, _json_value?), do: [expr: item]
+
+  defp encoded_element(item, true), do: [raw: "json(", expr: Jason.encode!(item), raw: ")"]
+  defp encoded_element(item, false), do: [expr: Jason.encode!(item)]
 
   defp handle_map_comparison(
          query,
@@ -260,8 +407,17 @@ defmodule AshSqlite.SqlImplementation do
 
     result =
       case operator do
-        :== -> Ecto.Query.dynamic(^left_expr == ^right_expr)
-        :!= -> Ecto.Query.dynamic(^left_expr != ^right_expr)
+        :== ->
+          Ecto.Query.dynamic(^left_expr == ^right_expr)
+
+        :!= ->
+          Ecto.Query.dynamic(^left_expr != ^right_expr)
+
+        :is_distinct_from ->
+          Ecto.Query.dynamic(fragment("(? IS DISTINCT FROM ?)", ^left_expr, ^right_expr))
+
+        :is_not_distinct_from ->
+          Ecto.Query.dynamic(fragment("(? IS NOT DISTINCT FROM ?)", ^left_expr, ^right_expr))
       end
 
     {:ok, result, acc}

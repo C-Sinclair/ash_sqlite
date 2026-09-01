@@ -4,22 +4,26 @@
 
 defmodule AshSqlite.TransactionTest do
   @moduledoc """
-  Transactions are off by default and roll back when turned on.
+  Write transactions are off by default, and roll back when turned on.
 
-  SQLite allows one writer at a time and a contended write fails rather than
-  queueing, so this is opt-in per resource. `AshSqlite.Test.Account` and
-  `AshSqlite.Test.TransactionalAccount` share a table and differ only in
-  `transactions?`, which is what makes the pair worth testing together.
+  `AshSqlite.Test.Account` and `AshSqlite.Test.TransactionalAccount` share a table
+  and differ only in `write_transactions?`, which is what makes the pair worth
+  testing together: the contrast is the feature.
   """
   use AshSqlite.RepoCase, async: false
 
   alias AshSqlite.Test.{Account, TransactionalAccount}
 
-  require Ash.Query
-
   test "transactions are off unless the resource asks for them" do
     refute Ash.DataLayer.data_layer_can?(Account, :transact)
     assert Ash.DataLayer.data_layer_can?(TransactionalAccount, :transact)
+  end
+
+  test "a mutation action reports the transaction it will actually get" do
+    # Ash derives `transaction? true` on mutations, then clears it again when the
+    # data layer cannot transact — neither resource says anything about it.
+    refute Ash.Resource.Info.action(Account, :create).transaction?
+    assert Ash.Resource.Info.action(TransactionalAccount, :create).transaction?
   end
 
   test "a failing multi-step action rolls back" do
@@ -42,8 +46,6 @@ defmodule AshSqlite.TransactionTest do
   end
 
   test "without transactions the same failure leaves the row behind" do
-    # Not an endorsement, just the contrast: this is what every AshSqlite
-    # resource does today, and why `transactions?` is worth having.
     assert {:error, _} =
              Account
              |> Ash.Changeset.for_create(:create, %{is_active: true})
@@ -55,7 +57,7 @@ defmodule AshSqlite.TransactionTest do
     assert [_] = Ash.read!(Account)
   end
 
-  test "in_transaction?/1 answers rather than raising when nothing is bound" do
+  test "in_transaction?/1 answers rather than raising when no repo is bound" do
     refute AshSqlite.DataLayer.in_transaction?(TransactionalAccount)
   end
 
