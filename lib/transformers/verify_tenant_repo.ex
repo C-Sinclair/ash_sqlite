@@ -13,14 +13,10 @@ defmodule AshSqlite.Transformers.VerifyTenantRepo do
   # module exists.
   def after_compile?, do: true
 
-  # `put_dynamic_repo/1` binds per repo *module*, so a binder can only bind one of
-  # them. `AshSqlite.MultiTenancy.Binder` binds the mutate repo; a resource whose
-  # read repo is a different module would issue its reads on a module nothing bound,
-  # against that module's own configured database -- which for a database-per-tenant
-  # layout is every tenant's rows at once, with nothing raising.
-  #
-  # Only checked for the default binder. A binder of its own sees `usage` and can
-  # bind a read replica separately, which is the case this would otherwise forbid.
+  # `put_dynamic_repo/1` binds per repo *module*, and the default binder binds the
+  # mutate one -- so a split read repo would serve reads from its own configured
+  # database, unbound, with nothing raising. Only checked for the default binder: a
+  # binder of its own sees `usage` and can bind a replica deliberately.
   def transform(dsl) do
     with true <- Ash.Resource.Info.multitenancy_strategy(dsl) == :context,
          nil <- Transformer.get_option(dsl, [:sqlite], :tenant_binder),
