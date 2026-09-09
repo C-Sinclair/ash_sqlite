@@ -151,7 +151,10 @@ defmodule AshSqlite.MixProject do
       {:ecto_libsql, "~> 0.9", optional: true},
       {:ecto, "~> 3.13"},
       {:jason, "~> 1.0"},
-      {:ash, ash_version("~> 3.33")},
+      # ash-project/ash#2917 puts the tenant on the transaction reason, and
+      # `AshSqlite.DataLayer.transaction/4` reads it. Restore `ash_version("~> 3.34")`
+      # once a release carries it.
+      {:ash, ash_version(git: "https://github.com/ash-project/ash.git", override: true)},
       {:ash_sql, ash_sql_version("~> 0.2 and >= 0.6.9")},
       {:igniter, "~> 0.6 and >= 0.6.14", optional: true},
       {:simple_sat, ">= 0.0.0", only: [:dev, :test]},
