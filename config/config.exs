@@ -26,6 +26,10 @@ if Mix.env() == :test do
   config :ash, :validate_domain_config_inclusion?, false
   config :ash, :warn_on_transaction_hooks?, false
 
+  # Preserves pre-ash-3.33 length counting; see
+  # https://hexdocs.pm/ash/backwards-compatibility-config.html#default_string_length_count
+  config :ash, :default_string_length_count, :mixed
+
   config :ash_sqlite, AshSqlite.TestRepo,
     database: Path.join(__DIR__, "../test/test.db"),
     pool_size: 1,
