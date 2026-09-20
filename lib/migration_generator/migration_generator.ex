@@ -2227,8 +2227,8 @@ defmodule AshSqlite.MigrationGenerator do
 
   defp do_snapshot(resource, table) do
     snapshot = %{
-      attributes: attributes(resource, table),
-      identities: identities(resource),
+      attributes: resource |> attributes(table) |> without_temporal_primary_key(resource),
+      identities: temporal_identities(resource),
       table: table || AshSqlite.DataLayer.Info.table(resource),
       custom_indexes: custom_indexes(resource),
       custom_statements: custom_statements(resource),
@@ -2247,6 +2247,32 @@ defmodule AshSqlite.MigrationGenerator do
     Map.put(snapshot, :hash, hash)
   end
 
+  # A temporal table holds one row per period, so the primary key cannot be unique on
+  # its own and there is nothing to promote to a composite key: SQLite has no
+  # `WITHOUT OVERLAPS`. `AshSqlite.Temporal.Migration` emits the uniqueness the key
+  # does have -- one current version per key -- as a partial unique index instead.
+  #
+  # Leaving `primary_key?` set would also make an integer key SQLite's rowid alias, and
+  # every `WHERE rowid = ?` in `AshSqlite.Temporal` would then be addressing the key.
+  defp without_temporal_primary_key(attributes, resource) do
+    if AshSqlite.Temporal.temporal?(resource) do
+      Enum.map(attributes, &Map.put(&1, :primary_key?, false))
+    else
+      attributes
+    end
+  end
+
+  # An identity on a temporal resource is unique per *period*, not per table, so a plain
+  # unique index over its keys would make history impossible. They become the same
+  # partial index and trigger pair the primary key gets.
+  defp temporal_identities(resource) do
+    if AshSqlite.Temporal.temporal?(resource) do
+      []
+    else
+      identities(resource)
+    end
+  end
+
   defp has_create_action?(resource) do
     resource
     |> Ash.Resource.Info.actions()
@@ -2262,11 +2288,17 @@ defmodule AshSqlite.MigrationGenerator do
   end
 
   defp custom_statements(resource) do
-    resource
-    |> AshSqlite.DataLayer.Info.custom_statements()
-    |> Enum.map(fn custom_statement ->
-      Map.take(custom_statement, AshSqlite.Statement.fields())
-    end)
+    written =
+      resource
+      |> AshSqlite.DataLayer.Info.custom_statements()
+      |> Enum.map(fn custom_statement ->
+        Map.take(custom_statement, AshSqlite.Statement.fields())
+      end)
+
+    # A temporal table's indexes and triggers are not optional, and the resource does
+    # not write them, so they are generated. They go first: a statement the user wrote
+    # may depend on them, and nothing here depends on a user statement.
+    AshSqlite.Temporal.Migration.statements(resource) ++ written
   end
 
   defp multitenancy(resource) do
@@ -2353,7 +2385,8 @@ defmodule AshSqlite.MigrationGenerator do
         end)
 
       if attribute.source == source_attribute_name && relationship.type == :belongs_to &&
-           foreign_key?(relationship) do
+           foreign_key?(relationship) &&
+           not temporal_destination?(relationship) do
         configured_reference =
           configured_reference(resource, table, attribute.source || attribute.name, relationship)
 
@@ -2390,6 +2423,32 @@ defmodule AshSqlite.MigrationGenerator do
         end
       end
     end)
+  end
+
+  # A temporal table has no unique key: it holds one row per period, so the primary key
+  # identifies a record rather than a row. SQLite requires the parent column of a
+  # foreign key to be a primary key or to carry a non-partial UNIQUE index, and there is
+  # no index that could satisfy it here without making a second version impossible.
+  # The table would still be created -- SQLite defers the check -- and then every insert
+  # into the child would fail with "foreign key mismatch".
+  #
+  # So no database foreign key is generated. `AshPostgres` does the same when only one
+  # side of a temporal relationship is temporal; it can do better when both are, because
+  # PG19 has `FOREIGN KEY (fk, PERIOD src) REFERENCES dest (pk, PERIOD dest)` and SQLite
+  # has no equivalent. The relationship itself still works: the overlap filter
+  # `Ash.Resource.Transformers.AddTemporalRelationshipFilters` bakes into
+  # `relationship.filter` is applied by every consumer, data layer included.
+  #
+  # Asking the destination about its temporality is safe here. The generator runs as a
+  # mix task, not at compile time, which is why the core transformer avoids the same
+  # question.
+  if AshSqlite.Temporal.supported?() do
+    defp temporal_destination?(relationship) do
+      Code.ensure_loaded?(relationship.destination) and
+        Ash.Resource.Info.temporal?(relationship.destination)
+    end
+  else
+    defp temporal_destination?(_relationship), do: false
   end
 
   defp configured_reference(resource, table, attribute, relationship) do

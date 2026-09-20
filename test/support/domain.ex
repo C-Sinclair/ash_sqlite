@@ -22,6 +22,14 @@ defmodule AshSqlite.Test.Domain do
     resource(AshSqlite.Test.Organization)
     resource(AshSqlite.Test.Manager)
     resource(AshSqlite.Test.Device)
+
+    # The temporal DSL is unreleased; the resource only exists when ash has it.
+    if Code.ensure_loaded?(Ash.Temporal) do
+      resource(AshSqlite.Test.Subscription)
+      resource(AshSqlite.Test.DatedSubscription)
+      resource(AshSqlite.Test.Plan)
+      resource(AshSqlite.Test.Enrollment)
+    end
   end
 
   authorization do

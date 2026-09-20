@@ -307,6 +307,9 @@ defmodule AshSqlite.DataLayer do
       AshSqlite.Transformers.ValidateReferences,
       AshSqlite.Transformers.VerifyRepo,
       AshSqlite.Transformers.EnsureTableOrPolymorphic
+    ],
+    verifiers: [
+      AshSqlite.Verifiers.VerifyTemporal
     ]
 
   def migrate(args) do
@@ -440,9 +443,9 @@ defmodule AshSqlite.DataLayer do
 
   import Ecto.Query, only: [from: 2]
 
-  # SQLite has no range type, so a range attribute is stored as JSON text. Ash builds
-  # its Ecto schema from this callback when the data layer answers it, so this is what
-  # makes the *write* path dump a range -- the expression seam in
+  # SQLite has no range type, so a range attribute is stored as JSON text. Ash
+  # builds its Ecto schema from this callback when the data layer answers it, so
+  # this is what makes the *write* path dump a range -- the expression seam in
   # `AshSqlite.SqlImplementation` only covers reads.
   @impl true
   def attribute_ecto_type(_resource, %{type: Ash.Type.Range}), do: AshSqlite.Type.Range
@@ -458,6 +461,10 @@ defmodule AshSqlite.DataLayer do
 
   def can?(resource, :transact), do: AshSqlite.DataLayer.Info.write_transactions?(resource)
   def can?(_, :composite_primary_key), do: true
+  # SQLite has no `FOR PORTION OF` and no exclusion constraint, so a period split is a
+  # read-modify-write in `AshSqlite.Temporal` rather than one statement. The semantics
+  # are the same; the enforcement underneath differs. See `AshSqlite.Temporal`.
+  def can?(_, :temporal), do: AshSqlite.Temporal.supported?()
   def can?(_, {:atomic, :update}), do: true
   def can?(_, {:atomic, :upsert}), do: true
   def can?(_, {:atomic, :create}), do: true
@@ -637,18 +644,103 @@ defmodule AshSqlite.DataLayer do
     ]
   end
 
+  # A point-in-time read is a containment test on the period. The bounds stay in the
+  # JSON and the planner matches the index built on the same `json_extract` expression,
+  # so this is an index seek for a keyed read rather than a scan.
+  #
+  # `set_as_of/3` is not a callback of a released ash, so defining it unconditionally
+  # would put `@impl true` on a behaviour that does not declare it.
+  if AshSqlite.Temporal.supported?() do
+    @impl true
+    def set_as_of(resource, query, as_of) do
+      as_of = Ash.Temporal.resolve_as_of(as_of)
+
+      if Ash.Resource.Info.temporal_strategy(resource) == :context && as_of do
+        attribute = AshSqlite.Temporal.attribute(resource)
+        encoded = AshSqlite.Temporal.encode(as_of)
+
+        {:ok,
+         from(row in query,
+           where:
+             fragment("json_extract(?, '$.lower') <= ?", field(row, ^attribute), ^encoded) and
+               (fragment("json_extract(?, '$.upper') IS NULL", field(row, ^attribute)) or
+                  fragment("json_extract(?, '$.upper') > ?", field(row, ^attribute), ^encoded))
+         )}
+      else
+        {:ok, query}
+      end
+    end
+  else
+    defp set_as_of(_resource, query, _as_of), do: {:ok, query}
+  end
+
   @impl true
   def resource_to_query(resource, _) do
     from(row in {AshSqlite.DataLayer.Info.table(resource) || "", resource}, [])
   end
 
   @impl true
-  def bulk_create(resource, stream, options) do
+  # The temporal arm is compiled out entirely against a released ash, where
+  # `temporal?/1` is a constant false and the branch is dead code.
+  if AshSqlite.Temporal.supported?() do
+    def bulk_create(resource, stream, options) do
+      if options[:upsert?] && AshSqlite.Temporal.temporal?(resource) do
+        temporal_bulk_upsert(resource, stream, options)
+      else
+        do_bulk_create(resource, stream, options)
+      end
+    end
+  else
+    def bulk_create(resource, stream, options), do: do_bulk_create(resource, stream, options)
+  end
+
+  if AshSqlite.Temporal.supported?() do
+    # SQLite cannot `ON CONFLICT` its way to a temporal upsert (see `temporal_upsert/3`),
+    # and `bulk_create/3` builds one whenever `upsert?` is set. Each changeset is resolved
+    # on its own instead, inside one transaction.
+    defp temporal_bulk_upsert(resource, stream, options) do
+      changesets = Enum.to_list(stream)
+      repo = AshSql.dynamic_repo(resource, AshSqlite.SqlImplementation, Enum.at(changesets, 0))
+      keys = options[:upsert_keys] || Ash.Resource.Info.primary_key(resource)
+
+      AshSqlite.Temporal.transactionally(repo, fn ->
+        changesets
+        |> Enum.reduce_while({:ok, []}, fn changeset, {:ok, acc} ->
+          case do_temporal_upsert(repo, resource, changeset, keys, options[:upsert_fields]) do
+            # Ash correlates a bulk result to its changeset by this metadata, and drops a
+            # record that does not carry it.
+            {:ok, record} ->
+              {:cont, {:ok, [tag_bulk_record(record, changeset) | acc]}}
+
+            {:error, error} ->
+              {:halt, {:error, error}}
+          end
+        end)
+        |> case do
+          {:ok, records} ->
+            if options[:return_records?], do: {:ok, Enum.reverse(records)}, else: {:ok, []}
+
+          other ->
+            other
+        end
+      end)
+    end
+
+    defp tag_bulk_record(record, changeset) do
+      case changeset.context do
+        %{bulk_create: %{ref: ref}} -> Ash.Resource.put_metadata(record, :bulk_action_ref, ref)
+        _other -> record
+      end
+    end
+  end
+
+  defp do_bulk_create(resource, stream, options) do
     # Cell-wise default values are not supported on INSERT statements by SQLite
     # This requires that we group changesets by what attributes are changing
     # And *omit* any defaults instead of using something like `(1, 2, DEFAULT)`
     # like we could with postgres
     stream
+    |> Enum.map(&stamp_period(resource, &1))
     |> Enum.group_by(&Map.keys(&1.attributes))
     |> Enum.reduce_while({:ok, []}, fn {_, changesets}, {:ok, acc} ->
       repo = AshSql.dynamic_repo(resource, AshSqlite.SqlImplementation, Enum.at(changesets, 0))
@@ -911,6 +1003,22 @@ defmodule AshSqlite.DataLayer do
 
       {:error, error} ->
         {:error, error}
+    end
+  end
+
+  # A temporal create establishes the period `as_of` names. The period attribute is
+  # never accepted as action input, so this is the only place it is set on a create.
+  defp stamp_period(resource, changeset) do
+    if AshSqlite.Temporal.temporal?(resource) do
+      attribute = AshSqlite.Temporal.attribute(resource)
+      as_of = AshSqlite.Temporal.write_instant(resource, changeset)
+      period = AshSqlite.Temporal.period(resource, as_of)
+
+      # `put_new`: a temporal upsert that misses has already bounded the period above
+      # by the version that follows it, and must not have that replaced by `[as_of, oo)`.
+      %{changeset | attributes: Map.put_new(changeset.attributes, attribute, period)}
+    else
+      changeset
     end
   end
 
@@ -1354,6 +1462,95 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def upsert(resource, changeset, keys \\ nil) do
+    if AshSqlite.Temporal.temporal?(resource) do
+      temporal_upsert(resource, changeset, keys || Ash.Resource.Info.primary_key(resource))
+    else
+      do_upsert(resource, changeset, keys)
+    end
+  end
+
+  # SQLite cannot `ON CONFLICT` its way to a temporal upsert. The only unique index on a
+  # temporal table is partial -- one current version per key -- and SQLite will not use a
+  # partial index as a conflict target unless the statement repeats its WHERE clause. So
+  # the match is resolved first and the two halves are issued separately, which is also
+  # what Postgres ends up doing for a different reason: it cannot `ON CONFLICT` against
+  # the `WITHOUT OVERLAPS` exclusion constraint either.
+  defp temporal_upsert(resource, changeset, keys) do
+    repo = AshSql.dynamic_repo(resource, AshSqlite.SqlImplementation, changeset)
+
+    AshSqlite.Temporal.transactionally(repo, fn ->
+      do_temporal_upsert(repo, resource, changeset, keys)
+    end)
+  end
+
+  defp do_temporal_upsert(repo, resource, changeset, keys) do
+    do_temporal_upsert(
+      repo,
+      resource,
+      changeset,
+      keys,
+      changeset.context[:private][:upsert_fields]
+    )
+  end
+
+  defp do_temporal_upsert(repo, resource, changeset, keys, upsert_fields) do
+    attribute = AshSqlite.Temporal.attribute(resource)
+    as_of = AshSqlite.Temporal.write_instant(resource, changeset)
+    pkey = Map.new(keys, fn key -> {key, Ash.Changeset.get_attribute(changeset, key)} end)
+
+    case AshSqlite.Temporal.current_version(repo, resource, pkey, as_of) do
+      nil ->
+        upper = AshSqlite.Temporal.next_lower_bound(repo, resource, pkey, as_of)
+        period = AshSqlite.Temporal.period(resource, as_of, upper)
+
+        create(resource, %{
+          changeset
+          | attributes: Map.put(changeset.attributes, attribute, period)
+        })
+
+      {rowid, prior} ->
+        # The rowid of the version the upsert now applies to: the prior one when the
+        # write landed on its own lower bound, otherwise the copy opened at `as_of`.
+        rowid =
+          case AshSqlite.Temporal.close_version(repo, resource, rowid, prior, as_of) do
+            :replace ->
+              rowid
+
+            {:closed, prior} ->
+              new_period = AshSqlite.Temporal.period(resource, as_of, prior.upper)
+              AshSqlite.Temporal.copy_forward(repo, resource, rowid, new_period)
+          end
+
+        attributes =
+          case upsert_fields do
+            nil -> changeset.attributes
+            fields -> Map.take(changeset.attributes, fields)
+          end
+
+        # The record is read back rather than built from the changeset, so the
+        # attributes the upsert did not name come from the row instead of the struct's
+        # defaults.
+        do_update(resource, %{
+          changeset
+          | action_type: :update,
+            action_select: action_select(resource, changeset),
+            attributes: Map.drop(attributes, [attribute] ++ keys),
+            data: AshSqlite.Temporal.version_at(repo, resource, rowid)
+        })
+    end
+  end
+
+  # A bulk create carries no action select, and an update that selects nothing is an
+  # Ecto error rather than an update returning nothing.
+  defp action_select(resource, changeset) do
+    case changeset.action_select do
+      nil -> Enum.map(Ash.Resource.Info.attributes(resource), & &1.name)
+      [] -> Enum.map(Ash.Resource.Info.attributes(resource), & &1.name)
+      selected -> selected
+    end
+  end
+
+  defp do_upsert(resource, changeset, keys) do
     keys = keys || Ash.Resource.Info.primary_key(keys)
 
     touch_update_defaults? =
@@ -1502,6 +1699,18 @@ defmodule AshSqlite.DataLayer do
 
   @impl true
   def update(resource, changeset) do
+    if AshSqlite.Temporal.temporal?(resource) do
+      repo = AshSql.dynamic_repo(resource, AshSqlite.SqlImplementation, changeset)
+
+      AshSqlite.Temporal.transactionally(repo, fn ->
+        AshSqlite.Temporal.update(repo, resource, changeset, &do_update(resource, &1))
+      end)
+    else
+      do_update(resource, changeset)
+    end
+  end
+
+  defp do_update(resource, changeset) do
     source = resolve_source(resource, changeset)
 
     query =
@@ -1547,17 +1756,32 @@ defmodule AshSqlite.DataLayer do
     end
   end
 
+  # For a temporal resource the row identity is the primary key *plus* the period --
+  # the key alone names every version of the record, so filtering by it would aim a
+  # single-row update at the whole history.
   defp pkey_filter(query, %resource{} = record) do
     pkey =
       record
-      |> Map.take(Ash.Resource.Info.primary_key(resource))
+      |> Map.take(AshSqlite.Temporal.identity_fields(resource))
       |> Map.to_list()
 
     Ecto.Query.where(query, ^pkey)
   end
 
   @impl true
-  def destroy(resource, %{data: record} = changeset) do
+  def destroy(resource, changeset) do
+    if AshSqlite.Temporal.temporal?(resource) do
+      repo = AshSql.dynamic_repo(resource, AshSqlite.SqlImplementation, changeset)
+
+      AshSqlite.Temporal.transactionally(repo, fn ->
+        AshSqlite.Temporal.destroy(repo, resource, changeset, &do_destroy_changeset(resource, &1))
+      end)
+    else
+      do_destroy_changeset(resource, changeset)
+    end
+  end
+
+  defp do_destroy_changeset(resource, %{data: record} = changeset) do
     source = resolve_source(resource, changeset)
 
     query =
@@ -1634,6 +1858,61 @@ defmodule AshSqlite.DataLayer do
   def update_query(query, changeset, resource, options) do
     repo = AshSql.dynamic_repo(resource, AshSqlite.SqlImplementation, changeset)
 
+    if AshSqlite.Temporal.temporal?(resource) do
+      AshSqlite.Temporal.transactionally(repo, fn ->
+        {:ok, query} = temporal_split(repo, query, changeset, resource)
+        do_update_query(query, changeset, resource, options, repo)
+      end)
+    else
+      do_update_query(query, changeset, resource, options, repo)
+    end
+  end
+
+  # The instant a write against a query takes effect. The query's own pin wins, because
+  # Ash has already applied it as a containment filter and a split at any other instant
+  # produces versions that filter matches neither of. `AshPostgres.DataLayer` resolves
+  # the bound the same way, for the same reason.
+  # Both arms go through `write_instant/2`, which casts to the resource's own period
+  # type. The query's pin arrives as a `DateTime` whatever the resource stores, so a
+  # `:date` period would otherwise be split at a timestamp and stop comparing against
+  # its own bounds.
+  defp write_instant_for(query, resource, changeset) do
+    case get_in(query.__ash_bindings__, [:context, :private, :as_of]) do
+      nil -> AshSqlite.Temporal.write_instant(resource, changeset)
+      as_of -> AshSqlite.Temporal.write_instant(resource, as_of)
+    end
+  end
+
+  # Splits every version the query matches, then runs the caller's statement against a
+  # query pinned to `as_of`. After the split that query matches exactly the new
+  # versions, so the statement needs no knowledge that a split happened.
+  defp temporal_split(repo, query, changeset, resource) do
+    as_of = write_instant_for(query, resource, changeset)
+    {:ok, query} = set_as_of(resource, query, as_of)
+
+    repo
+    |> matching_rowids(query)
+    |> then(&AshSqlite.Temporal.split_all(repo, resource, &1, as_of))
+
+    {:ok, query}
+  end
+
+  # The rowids a data layer query matches. `rowid` is SQLite's own row identity and is
+  # stable within a statement, which is what the split needs -- the primary key is not
+  # unique on a temporal table, and the period is the thing being rewritten.
+  #
+  # Only `:select` is dropped, and only because it is being replaced. A `:limit` must
+  # survive: Ash puts one on a bulk update's query, and splitting past it would rewrite
+  # the periods of rows the update then leaves alone. `:order_by` survives with it,
+  # because which rows a limit selects depends on it.
+  defp matching_rowids(repo, query) do
+    query
+    |> Ecto.Query.exclude(:select)
+    |> Ecto.Query.select([row], fragment("rowid"))
+    |> repo.all()
+  end
+
+  defp do_update_query(query, changeset, resource, options, repo) do
     ecto_changeset =
       case changeset.data do
         %Ash.Changeset.OriginalDataNotAvailable{} ->
@@ -1759,6 +2038,36 @@ defmodule AshSqlite.DataLayer do
   def destroy_query(query, changeset, resource, options) do
     repo = AshSql.dynamic_repo(resource, AshSqlite.SqlImplementation, changeset)
 
+    if AshSqlite.Temporal.temporal?(resource) do
+      AshSqlite.Temporal.transactionally(repo, fn ->
+        temporal_destroy_query(repo, query, changeset, resource, options)
+      end)
+    else
+      do_destroy_query(query, changeset, resource, options, repo)
+    end
+  end
+
+  # A temporal destroy ends validity rather than removing rows. Only a version whose
+  # period begins exactly at `as_of` is deleted, because truncating it would leave a
+  # period of zero width rather than a shortened history.
+  defp temporal_destroy_query(repo, query, changeset, resource, options) do
+    as_of = write_instant_for(query, resource, changeset)
+    {:ok, pinned} = set_as_of(resource, query, as_of)
+
+    case repo
+         |> matching_rowids(pinned)
+         |> then(&AshSqlite.Temporal.truncate_all(repo, resource, &1, as_of)) do
+      [] ->
+        if options[:return_records?], do: {:ok, []}, else: :ok
+
+      rowids ->
+        pinned
+        |> Ecto.Query.where([row], fragment("rowid") in ^rowids)
+        |> do_destroy_query(changeset, resource, options, repo)
+    end
+  end
+
+  defp do_destroy_query(query, changeset, resource, options, repo) do
     ecto_changeset =
       case changeset.data do
         %Ash.Changeset.OriginalDataNotAvailable{} ->
@@ -1939,8 +2248,13 @@ defmodule AshSqlite.DataLayer do
 
             case root_query_result do
               {:ok, root_query, acc, selected_atomics?} ->
+                # On a temporal resource the primary key names every version of a
+                # record, so joining on it alone makes the outer UPDATE hit the closed
+                # ones too and falsifies history. The period completes the identity, as
+                # it does in `pkey_filter/2`.
                 dynamic =
-                  Enum.reduce(Ash.Resource.Info.primary_key(resource), nil, fn pkey, dynamic ->
+                  Enum.reduce(AshSqlite.Temporal.identity_fields(resource), nil, fn pkey,
+                                                                                    dynamic ->
                     if dynamic do
                       Ecto.Query.dynamic(
                         [row, joining],
