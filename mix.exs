@@ -173,6 +173,9 @@ defmodule AshSqlite.MixProject do
       "main" ->
         [git: "https://github.com/ash-project/ash.git", override: true]
 
+      "temporal" ->
+        [git: "https://github.com/ash-project/ash.git", branch: "temporal", override: true]
+
       version when is_binary(version) ->
         "~> #{version}"
 
@@ -191,6 +194,9 @@ defmodule AshSqlite.MixProject do
 
       "main" ->
         [git: "https://github.com/ash-project/ash_sql.git"]
+
+      "temporal" ->
+        [git: "https://github.com/ash-project/ash_sql.git", branch: "temporal", override: true]
 
       version when is_binary(version) ->
         "~> #{version}"
