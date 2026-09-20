@@ -440,6 +440,15 @@ defmodule AshSqlite.DataLayer do
 
   import Ecto.Query, only: [from: 2]
 
+  # SQLite has no range type, so a range attribute is stored as JSON text. Ash builds
+  # its Ecto schema from this callback when the data layer answers it, so this is what
+  # makes the *write* path dump a range -- the expression seam in
+  # `AshSqlite.SqlImplementation` only covers reads.
+  @impl true
+  def attribute_ecto_type(_resource, %{type: Ash.Type.Range}), do: AshSqlite.Type.Range
+
+  def attribute_ecto_type(_resource, _attribute), do: nil
+
   @impl true
   def can?(_, :async_engine), do: false
   def can?(_, :bulk_create), do: true

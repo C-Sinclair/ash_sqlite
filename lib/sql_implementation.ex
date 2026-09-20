@@ -284,6 +284,115 @@ defmodule AshSqlite.SqlImplementation do
     handle_map_comparison(query, :==, left, right, pred_embedded?, bindings, embedded?, acc, type)
   end
 
+  # Range functions. SQLite has no range type, so `AshSqlite.Type.Range` stores a
+  # range as JSON text and every range predicate below is comparisons on
+  # `json_extract` of its keys. Two consequences worth knowing before editing:
+  #
+  #   * The comparison is the inner type's *stored* comparison, which for
+  #     datetimes is lexicographic on ISO8601. Both operands must therefore be
+  #     encoded by `AshSqlite.Type.RangeBound`, never by the adapter's codec --
+  #     see that module for what goes silently wrong otherwise.
+  #   * There is no index behind any of this. Postgres answers overlap from a
+  #     GiST index; here it is a scan. A `json_extract` expression index can back
+  #     the bound comparisons, but it cannot make overlap itself indexable.
+  def expr(
+        query,
+        %Ash.Query.Function.RangeOverlaps{arguments: [left, right], embedded?: pred_embedded?},
+        bindings,
+        embedded?,
+        acc,
+        _type
+      ) do
+    {[left_type, right_type], _} =
+      determine_types(Ash.Query.Function.RangeOverlaps, [left, right], :boolean)
+
+    range_fragment(
+      query,
+      bindings,
+      pred_embedded? || embedded?,
+      acc,
+      [{left, left_type}, {right, right_type}],
+      fn [l, r] -> overlaps_sql(l, r) end
+    )
+  end
+
+  def expr(
+        query,
+        %Ash.Query.Function.RangeContains{arguments: [left, right], embedded?: pred_embedded?},
+        bindings,
+        embedded?,
+        acc,
+        _type
+      ) do
+    {[left_type, right_type], _} =
+      determine_types(Ash.Query.Function.RangeContains, [left, right], :boolean)
+
+    if range_argument?(right) do
+      range_fragment(
+        query,
+        bindings,
+        pred_embedded? || embedded?,
+        acc,
+        [{left, left_type}, {right, right_type}],
+        fn [l, r] -> contains_range_sql(l, r) end
+      )
+    else
+      # A point is compared against the range's bounds, so it must be encoded by
+      # the same encoder the bounds were.
+      range_fragment(
+        query,
+        bindings,
+        pred_embedded? || embedded?,
+        acc,
+        [{left, left_type}, point_operand(right)],
+        fn [l, point] -> contains_point_sql(l, point) end
+      )
+    end
+  end
+
+  def expr(
+        query,
+        %Ash.Query.Function.RangeAdjacent{arguments: [left, right], embedded?: pred_embedded?},
+        bindings,
+        embedded?,
+        acc,
+        _type
+      ) do
+    {[left_type, right_type], _} =
+      determine_types(Ash.Query.Function.RangeAdjacent, [left, right], :boolean)
+
+    range_fragment(
+      query,
+      bindings,
+      pred_embedded? || embedded?,
+      acc,
+      [{left, left_type}, {right, right_type}],
+      fn [l, r] -> adjacent_sql(l, r) end
+    )
+  end
+
+  def expr(
+        query,
+        %Ash.Query.Function.RangeLower{arguments: [range], embedded?: pred_embedded?},
+        bindings,
+        embedded?,
+        acc,
+        type
+      ) do
+    range_bound_expr(query, range, "lower", bindings, pred_embedded? || embedded?, acc, type)
+  end
+
+  def expr(
+        query,
+        %Ash.Query.Function.RangeUpper{arguments: [range], embedded?: pred_embedded?},
+        bindings,
+        embedded?,
+        acc,
+        type
+      ) do
+    range_bound_expr(query, range, "upper", bindings, pred_embedded? || embedded?, acc, type)
+  end
+
   # `is_distinct_from` is the NULL-safe form of `!=`, and Ash emits it in place of `!=` whenever
   # either side can be nil (see `Ash.Query.Function.IsDistinctFrom.new/1`). It needs the same
   # JSON treatment as the two clauses above, and without it a map reaches the driver as a bare
@@ -384,6 +493,247 @@ defmodule AshSqlite.SqlImplementation do
       ) do
     :error
   end
+
+  defp range_fragment(query, bindings, embedded?, acc, operands, builder) do
+    {dynamics, acc} =
+      Enum.map_reduce(operands, acc, fn {operand, type}, acc ->
+        AshSql.Expr.dynamic_expr(query, operand, bindings, embedded?, type, acc)
+      end)
+
+    {expr, acc} =
+      AshSql.Expr.dynamic_expr(
+        query,
+        %Ash.Query.Function.Fragment{
+          embedded?: embedded?,
+          arguments: merge_raw_parts(builder.(dynamics))
+        },
+        bindings,
+        embedded?,
+        nil,
+        acc
+      )
+
+    {:ok, expr, acc}
+  end
+
+  # The value this yields is the bound in the inner type's *stored* form, which
+  # Ash casts on the way out. Casting it in SQL instead would ask Ecto to cast to
+  # a type SQLite has no native form for.
+  defp range_bound_expr(query, range, key, bindings, embedded?, acc, _type) do
+    {[range_type], _} =
+      determine_types(Ash.Query.Function.RangeLower, [range], nil)
+
+    range_fragment(query, bindings, embedded?, acc, [{range, range_type}], fn [r] ->
+      json_at(r, key)
+    end)
+  end
+
+  # Ecto's `Inspect` implementation for queries walks a fragment expecting raw
+  # and interpolated parts to alternate, and it raises on two raw parts in a row
+  # -- while *building an error message*, so a real query error would surface as
+  # a FunctionClauseError in `unmerge_fragments/3` instead. The SQL below is
+  # assembled from small pieces, so adjacent raw parts are the normal case.
+  defp merge_raw_parts(parts) do
+    parts
+    |> Enum.reduce([], fn
+      {:raw, next}, [{:raw, previous} | rest] -> [{:raw, previous <> next} | rest]
+      part, acc -> [part | acc]
+    end)
+    |> Enum.reverse()
+  end
+
+  defp json_at(operand, key) do
+    [raw: "json_extract(", casted_expr: operand, raw: ", '$.#{key}')"]
+  end
+
+  # Overlap is symmetric: each range's upper bound must lie after the other's
+  # lower bound. An absent bound is SQL NULL and reads as unbounded; a NULL
+  # *range* makes every comparison NULL, which is the nil semantics
+  # `Ash.Query.Function.RangeOverlaps.evaluate/1` has at runtime.
+  defp overlaps_sql(left, right) do
+    List.flatten([
+      [raw: "("],
+      json_at(left, "empty"),
+      [raw: " = 0 AND "],
+      json_at(right, "empty"),
+      [raw: " = 0 AND ("],
+      upper_after_lower_sql(left, right),
+      [raw: ") AND ("],
+      upper_after_lower_sql(right, left),
+      [raw: "))"]
+    ])
+  end
+
+  defp upper_after_lower_sql(a, b) do
+    List.flatten([
+      json_at(a, "upper"),
+      [raw: " IS NULL OR "],
+      json_at(b, "lower"),
+      [raw: " IS NULL OR "],
+      json_at(a, "upper"),
+      [raw: " > "],
+      json_at(b, "lower"),
+      [raw: " OR ("],
+      json_at(a, "upper"),
+      [raw: " = "],
+      json_at(b, "lower"),
+      [raw: " AND "],
+      json_at(a, "bounds"),
+      [raw: " IN ('[]','(]') AND "],
+      json_at(b, "bounds"),
+      [raw: " IN ('[]','[)'))"]
+    ])
+  end
+
+  defp contains_range_sql(outer, inner) do
+    List.flatten([
+      [raw: "(("],
+      json_at(inner, "empty"),
+      [raw: " = 1) OR ("],
+      json_at(outer, "empty"),
+      [raw: " = 0 AND ("],
+      lower_encloses_sql(outer, inner),
+      [raw: ") AND ("],
+      upper_encloses_sql(outer, inner),
+      [raw: ")))"]
+    ])
+  end
+
+  defp lower_encloses_sql(outer, inner) do
+    List.flatten([
+      json_at(outer, "lower"),
+      [raw: " IS NULL OR ("],
+      json_at(inner, "lower"),
+      [raw: " IS NOT NULL AND ("],
+      json_at(outer, "lower"),
+      [raw: " < "],
+      json_at(inner, "lower"),
+      [raw: " OR ("],
+      json_at(outer, "lower"),
+      [raw: " = "],
+      json_at(inner, "lower"),
+      [raw: " AND ("],
+      json_at(outer, "bounds"),
+      [raw: " IN ('[]','[)') OR "],
+      json_at(inner, "bounds"),
+      [raw: " IN ('(]','()')))))"]
+    ])
+  end
+
+  defp upper_encloses_sql(outer, inner) do
+    List.flatten([
+      json_at(outer, "upper"),
+      [raw: " IS NULL OR ("],
+      json_at(inner, "upper"),
+      [raw: " IS NOT NULL AND ("],
+      json_at(inner, "upper"),
+      [raw: " < "],
+      json_at(outer, "upper"),
+      [raw: " OR ("],
+      json_at(inner, "upper"),
+      [raw: " = "],
+      json_at(outer, "upper"),
+      [raw: " AND ("],
+      json_at(outer, "bounds"),
+      [raw: " IN ('[]','(]') OR "],
+      json_at(inner, "bounds"),
+      [raw: " IN ('[)','()')))))"]
+    ])
+  end
+
+  defp contains_point_sql(range, point) do
+    List.flatten([
+      [raw: "("],
+      json_at(range, "empty"),
+      [raw: " = 0 AND ("],
+      json_at(range, "lower"),
+      [raw: " IS NULL OR "],
+      json_at(range, "lower"),
+      [raw: " < "],
+      [casted_expr: point],
+      [raw: " OR ("],
+      json_at(range, "lower"),
+      [raw: " = "],
+      [casted_expr: point],
+      [raw: " AND "],
+      json_at(range, "bounds"),
+      [raw: " IN ('[]','[)'))) AND ("],
+      json_at(range, "upper"),
+      [raw: " IS NULL OR "],
+      [casted_expr: point],
+      [raw: " < "],
+      json_at(range, "upper"),
+      [raw: " OR ("],
+      [casted_expr: point],
+      [raw: " = "],
+      json_at(range, "upper"),
+      [raw: " AND "],
+      json_at(range, "bounds"),
+      [raw: " IN ('[]','(]'))))"]
+    ])
+  end
+
+  # Adjacent means no overlap and no gap, so exactly one of the two bounds that
+  # meet may be inclusive. Both inclusive overlap at the shared point; both
+  # exclusive leave it out of either range.
+  defp adjacent_sql(left, right) do
+    List.flatten([
+      [raw: "(("],
+      meets_sql(left, right),
+      [raw: ") OR ("],
+      meets_sql(right, left),
+      [raw: "))"]
+    ])
+  end
+
+  defp meets_sql(a, b) do
+    List.flatten([
+      json_at(a, "upper"),
+      [raw: " = "],
+      json_at(b, "lower"),
+      [raw: " AND (("],
+      json_at(a, "bounds"),
+      [raw: " IN ('[]','(]')) + ("],
+      json_at(b, "bounds"),
+      [raw: " IN ('[]','[)')) = 1)"]
+    ])
+  end
+
+  # `Ash.Query.Function.RangeContains` takes either a range or a point on the
+  # right, and `determine_types/3` reports both as the range type, so the shape
+  # has to come from the argument itself.
+  defp range_argument?(%Ash.Range{}), do: true
+  defp range_argument?(%Ash.Query.Ref{attribute: %{type: Ash.Type.Range}}), do: true
+
+  defp range_argument?(%Ash.Query.Function.Type{arguments: [_value, type | _]}),
+    do: range_argument?(type)
+
+  defp range_argument?(Ash.Type.Range), do: true
+  defp range_argument?({Ash.Type.Range, _constraints}), do: true
+  defp range_argument?(_other), do: false
+
+  # A literal point is encoded here rather than typed, because the encoding has
+  # to be the one `AshSqlite.Type.RangeBound` performs and Ecto has no native
+  # type to hang it off. A point that is *not* a literal -- another column, say
+  # -- is left to the adapter, which agrees only if that column carries the same
+  # precision as the range's bounds.
+  defp point_operand(%Ash.Query.Function.Type{arguments: [value | _]} = wrapped) do
+    case point_operand(value) do
+      {^value, _type} -> {wrapped, nil}
+      encoded -> encoded
+    end
+  end
+
+  defp point_operand(%DateTime{} = value), do: {AshSqlite.Type.RangeBound.encode(value), nil}
+
+  defp point_operand(%NaiveDateTime{} = value),
+    do: {AshSqlite.Type.RangeBound.encode(value), nil}
+
+  defp point_operand(%Date{} = value), do: {AshSqlite.Type.RangeBound.encode(value), nil}
+  defp point_operand(value) when is_integer(value), do: {value, nil}
+  defp point_operand(value), do: {value, nil}
+
+  defp sqlite_range_type, do: Ecto.ParameterizedType.init(AshSqlite.Type.Range, [])
 
   # SQLite has no `ARRAY[...]` constructor, so the `ARRAY[...]` / `array_to_json(ARRAY[...])`
   # rendering AshSql falls back to is a syntax error here:
@@ -836,6 +1186,16 @@ defmodule AshSqlite.SqlImplementation do
   def parameterized_type({type, constraints}, []) do
     parameterized_type(type, constraints)
   end
+
+  # SQLite has no range type, so a range is stored as JSON text. This has to
+  # intercept both the Ash type and the Ecto type Ash derives from it, because
+  # which one arrives depends on whether the caller already resolved it.
+  def parameterized_type(type, _constraints)
+      when type in [Ash.Type.Range, Ash.Type.Range.EctoType],
+      do: sqlite_range_type()
+
+  def parameterized_type({:parameterized, {Ash.Type.Range.EctoType, _}}, _),
+    do: sqlite_range_type()
 
   def parameterized_type(type, _constraints)
       when type in [Ash.Type.Map, Ash.Type.Map.EctoType],

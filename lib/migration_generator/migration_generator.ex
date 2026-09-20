@@ -2541,6 +2541,8 @@ defmodule AshSqlite.MigrationGenerator do
 
   defp migration_type(Ash.Type.CiString, _), do: :citext
   defp migration_type(Ash.Type.UUID, _), do: :uuid
+  # A range is stored as JSON text; SQLite has no range type.
+  defp migration_type(Ash.Type.Range, _), do: :text
   defp migration_type(Ash.Type.Integer, _), do: :bigint
 
   defp migration_type(other, constraints) do
